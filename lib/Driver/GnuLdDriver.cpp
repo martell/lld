@@ -15,6 +15,7 @@
 
 #include "lld/Driver/Driver.h"
 #include "lld/ReaderWriter/ELFLinkingContext.h"
+#include "lld/ReaderWriter/PECOFFLinkingContext.h"
 #include "lld/ReaderWriter/LinkerScript.h"
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/Optional.h"
@@ -147,11 +148,61 @@ static bool parseMaxPageSize(StringRef opt, uint64_t &val) {
   return true;
 }
 
-bool GnuLdDriver::linkELF(int argc, const char *argv[], raw_ostream &diag) {
+bool GnuLdDriver::linkGNU(int argc, const char *argv[], raw_ostream &diag) {
   BumpPtrAllocator alloc;
   std::tie(argc, argv) = maybeExpandResponseFiles(argc, argv, alloc);
+
+  // Parse command line options using GnuLdOptions.td
+  std::unique_ptr<llvm::opt::InputArgList> parsedArgs;
+  GnuLdOptTable table;
+  unsigned missingIndex;
+  unsigned missingCount;
+
+  parsedArgs.reset(
+      table.ParseArgs(&argv[1], &argv[argc], missingIndex, missingCount));
+  if (missingCount) {
+    diag << "error: missing arg value for '"
+         << parsedArgs->getArgString(missingIndex) << "' expected "
+         << missingCount << " argument(s).\n";
+    return false;
+  }
+
+  // Handle --help
+  if (parsedArgs->hasArg(OPT_help)) {
+    table.PrintHelp(llvm::outs(), argv[0], "LLVM Linker", false);
+    return true;
+  }
+
+  // Use -target or use default target triple to instantiate LinkingContext
+  llvm::Triple baseTriple;
+  if (auto *arg = parsedArgs->getLastArg(OPT_target)) {
+    baseTriple = llvm::Triple(arg->getValue());
+  } else {
+    baseTriple = getDefaultTarget(argv[0]);
+  }
+  llvm::Triple triple(baseTriple);
+
+  if (!applyEmulation(triple, *parsedArgs, diag))
+    return false;
+
+  if (triple.getOS() == llvm::Triple::Win32) {
+    if(!linkPECOFF(*parsedArgs, triple, diag))
+      return false;
+  } else {
+    if(!linkELF(*parsedArgs, triple, baseTriple, diag))
+      return false;
+  }
+
+  return true;
+}
+
+bool GnuLdDriver::linkELF(llvm::opt::InputArgList &args,
+                          llvm::Triple &triple,
+                          llvm::Triple &baseTriple,
+                          raw_ostream &diag) {
+
   std::unique_ptr<ELFLinkingContext> options;
-  if (!parse(argc, argv, options, diag))
+  if (!parseELF(args, triple, baseTriple, options, diag))
     return false;
   if (!options)
     return true;
@@ -166,8 +217,65 @@ bool GnuLdDriver::linkELF(int argc, const char *argv[], raw_ostream &diag) {
   return linked;
 }
 
+bool GnuLdDriver::linkPECOFF(llvm::opt::InputArgList &args,
+                             llvm::Triple &triple,
+                             raw_ostream &diag) {
+
+  PECOFFLinkingContext ctx;
+  ctx.setParseDirectives(parseDirectives);
+  ctx.registry().addSupportCOFFObjects(ctx);
+  ctx.registry().addSupportCOFFImportLibraries(ctx);
+  ctx.registry().addSupportArchives(ctx.logInputFiles());
+  ctx.registry().addSupportYamlFiles();
+
+  if (!parsePECOFF(args, triple, ctx, diag))
+    return false;
+
+  bool linked = link(ctx, diag);
+  return linked;
+}
+
+bool GnuLdDriver::parseDirectives(int argc, const char *argv[],
+                                  PECOFFLinkingContext &info,
+                                  raw_ostream &diag) {
+
+  std::unique_ptr<llvm::opt::InputArgList> parsedArgs;
+  GnuLdOptTable table;
+  unsigned missingIndex;
+  unsigned missingCount;
+
+  parsedArgs.reset(
+      table.ParseArgs(&argv[1], &argv[argc], missingIndex, missingCount));
+  if (missingCount) {
+    diag << "error: missing arg value for '"
+         << parsedArgs->getArgString(missingIndex) << "' expected "
+         << missingCount << " argument(s).\n";
+    return false;
+  }
+
+  // Use -target or use default target triple to instantiate LinkingContext
+  llvm::Triple baseTriple;
+  if (auto *arg = parsedArgs->getLastArg(OPT_target)) {
+    baseTriple = llvm::Triple(arg->getValue());
+  } else {
+    baseTriple = getDefaultTarget(argv[0]);
+  }
+  llvm::Triple triple(baseTriple);
+
+  return parsePECOFF(*parsedArgs, triple, info, diag, true);
+}
+
 static llvm::Optional<llvm::Triple::ArchType>
 getArchType(const llvm::Triple &triple, StringRef value) {
+
+  //the base arch can be wrong for windows so just check the PE target
+  if (value == "i386pe")
+    return llvm::Triple::x86;
+  if (value == "i386pep")
+    return llvm::Triple::x86_64;
+  if (value == "thumb2pe")
+    return llvm::Triple::arm;
+
   switch (triple.getArch()) {
   case llvm::Triple::x86:
   case llvm::Triple::x86_64:
@@ -196,6 +304,29 @@ getArchType(const llvm::Triple &triple, StringRef value) {
   }
 }
 
+static llvm::COFF::MachineTypes
+getCOFFType(const llvm::Triple &triple) {
+  switch (triple.getArch()) {
+  case llvm::Triple::x86:
+    return llvm::COFF::IMAGE_FILE_MACHINE_I386;
+  case llvm::Triple::x86_64:
+    return llvm::COFF::IMAGE_FILE_MACHINE_AMD64;
+  case llvm::Triple::arm:
+  case llvm::Triple::thumb:
+      return llvm::COFF::IMAGE_FILE_MACHINE_ARMNT;
+  default:
+    return llvm::COFF::IMAGE_FILE_MACHINE_UNKNOWN;
+  }
+}
+
+static llvm::COFF::WindowsSubsystem
+getSubsystem(StringRef value) {
+  return llvm::StringSwitch<llvm::COFF::WindowsSubsystem>(value.lower())
+      .Case("windows", llvm::COFF::IMAGE_SUBSYSTEM_WINDOWS_GUI)
+      .Case("console", llvm::COFF::IMAGE_SUBSYSTEM_WINDOWS_CUI)
+      .Default(llvm::COFF::IMAGE_SUBSYSTEM_UNKNOWN);
+}
+
 static bool isLinkerScript(StringRef path, raw_ostream &diag) {
   llvm::sys::fs::file_magic magic = llvm::sys::fs::file_magic::unknown;
   if (std::error_code ec = llvm::sys::fs::identify_magic(path, magic)) {
@@ -207,7 +338,24 @@ static bool isLinkerScript(StringRef path, raw_ostream &diag) {
 }
 
 static ErrorOr<StringRef>
-findFile(ELFLinkingContext &ctx, StringRef path, bool dashL) {
+findFileELF(ELFLinkingContext &ctx, StringRef path, bool dashL) {
+  // If the path was referred to by using a -l argument, let's search
+  // for the file in the search path.
+  if (dashL) {
+    ErrorOr<StringRef> pathOrErr = ctx.searchLibrary(path);
+    if (std::error_code ec = pathOrErr.getError())
+      return make_dynamic_error_code(
+          Twine("Unable to find library -l") + path + ": " + ec.message());
+    path = pathOrErr.get();
+  }
+  if (!llvm::sys::fs::exists(path))
+    return make_dynamic_error_code(
+        Twine("lld: cannot find file ") + path);
+  return path;
+}
+
+static ErrorOr<StringRef>
+findFilePECOFF(PECOFFLinkingContext &ctx, StringRef path, bool dashL = true) {
   // If the path was referred to by using a -l argument, let's search
   // for the file in the search path.
   if (dashL) {
@@ -229,6 +377,17 @@ static bool isPathUnderSysroot(StringRef sysroot, StringRef path) {
   while (!path.empty() && !llvm::sys::fs::equivalent(sysroot, path))
     path = llvm::sys::path::parent_path(path);
   return !path.empty();
+}
+
+// Returns true if the given file node has already been added to the input
+// graph.
+static bool hasLibrary(PECOFFLinkingContext &ctx, File *file) {
+  StringRef path = file->path();
+  for (std::unique_ptr<Node> &p : ctx.getNodes())
+    if (auto *f = dyn_cast<FileNode>(p.get()))
+      if (f->getFile()->path() == path)
+        return true;
+  return false;
 }
 
 static std::error_code
@@ -351,41 +510,11 @@ getBool(const llvm::opt::InputArgList &parsedArgs,
   return llvm::None;
 }
 
-bool GnuLdDriver::parse(int argc, const char *argv[],
-                        std::unique_ptr<ELFLinkingContext> &context,
-                        raw_ostream &diag) {
-  // Parse command line options using GnuLdOptions.td
-  std::unique_ptr<llvm::opt::InputArgList> parsedArgs;
-  GnuLdOptTable table;
-  unsigned missingIndex;
-  unsigned missingCount;
-
-  parsedArgs.reset(
-      table.ParseArgs(&argv[1], &argv[argc], missingIndex, missingCount));
-  if (missingCount) {
-    diag << "error: missing arg value for '"
-         << parsedArgs->getArgString(missingIndex) << "' expected "
-         << missingCount << " argument(s).\n";
-    return false;
-  }
-
-  // Handle --help
-  if (parsedArgs->hasArg(OPT_help)) {
-    table.PrintHelp(llvm::outs(), argv[0], "LLVM Linker", false);
-    return true;
-  }
-
-  // Use -target or use default target triple to instantiate LinkingContext
-  llvm::Triple baseTriple;
-  if (auto *arg = parsedArgs->getLastArg(OPT_target)) {
-    baseTriple = llvm::Triple(arg->getValue());
-  } else {
-    baseTriple = getDefaultTarget(argv[0]);
-  }
-  llvm::Triple triple(baseTriple);
-
-  if (!applyEmulation(triple, *parsedArgs, diag))
-    return false;
+bool GnuLdDriver::parseELF(llvm::opt::InputArgList &args,
+                           llvm::Triple &triple,
+                           llvm::Triple &baseTriple,
+                           std::unique_ptr<ELFLinkingContext> &context,
+                           raw_ostream &diag) {
 
   std::unique_ptr<ELFLinkingContext> ctx(createELFLinkingContext(triple));
 
@@ -395,39 +524,39 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
   }
 
   // Copy mllvm
-  for (auto *arg : parsedArgs->filtered(OPT_mllvm))
+  for (auto *arg : args.filtered(OPT_mllvm))
     ctx->appendLLVMOption(arg->getValue());
 
   // Ignore unknown arguments.
-  for (auto unknownArg : parsedArgs->filtered(OPT_UNKNOWN))
+  for (auto unknownArg : args.filtered(OPT_UNKNOWN))
     diag << "warning: ignoring unknown argument: "
          << unknownArg->getValue() << "\n";
 
   // Set sys root path.
-  if (auto *arg = parsedArgs->getLastArg(OPT_sysroot))
+  if (auto *arg = args.getLastArg(OPT_sysroot))
     ctx->setSysroot(arg->getValue());
 
   // Handle --demangle option(For compatibility)
-  if (parsedArgs->hasArg(OPT_demangle))
+  if (args.hasArg(OPT_demangle))
     ctx->setDemangleSymbols(true);
 
   // Handle --no-demangle option.
-  if (parsedArgs->hasArg(OPT_no_demangle))
+  if (args.hasArg(OPT_no_demangle))
     ctx->setDemangleSymbols(false);
 
   // Figure out output kind (-r, -static, -shared)
-  if (parsedArgs->hasArg(OPT_relocatable)) {
+  if (args.hasArg(OPT_relocatable)) {
     ctx->setOutputELFType(llvm::ELF::ET_REL);
     ctx->setPrintRemainingUndefines(false);
     ctx->setAllowRemainingUndefines(true);
   }
 
-  if (parsedArgs->hasArg(OPT_static)) {
+  if (args.hasArg(OPT_static)) {
     ctx->setOutputELFType(llvm::ELF::ET_EXEC);
     ctx->setIsStaticExecutable(true);
   }
 
-  if (parsedArgs->hasArg(OPT_shared)) {
+  if (args.hasArg(OPT_shared)) {
     ctx->setOutputELFType(llvm::ELF::ET_DYN);
     ctx->setAllowShlibUndefines(true);
     ctx->setUseShlibUndefines(false);
@@ -436,12 +565,12 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
   }
 
   // Handle --stats.
-  if (parsedArgs->hasArg(OPT_stats)) {
+  if (args.hasArg(OPT_stats)) {
     ctx->setCollectStats(true);
   }
 
   // Figure out if the output type is nmagic/omagic
-  if (auto *arg = parsedArgs->getLastArg(
+  if (auto *arg = args.getLastArg(
         OPT_nmagic, OPT_omagic, OPT_no_omagic)) {
     switch (arg->getOption().getID()) {
     case OPT_nmagic:
@@ -459,25 +588,25 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
     }
   }
 
-  if (parsedArgs->hasArg(OPT_discard_loc))
+  if (args.hasArg(OPT_discard_loc))
     ctx->setDiscardLocals(true);
 
-  if (parsedArgs->hasArg(OPT_discard_temp_loc))
+  if (args.hasArg(OPT_discard_temp_loc))
     ctx->setDiscardTempLocals(true);
 
-  if (parsedArgs->hasArg(OPT_strip_all))
+  if (args.hasArg(OPT_strip_all))
     ctx->setStripSymbols(true);
 
-  if (auto *arg = parsedArgs->getLastArg(OPT_soname))
+  if (auto *arg = args.getLastArg(OPT_soname))
     ctx->setSharedObjectName(arg->getValue());
 
-  if (parsedArgs->hasArg(OPT_rosegment))
+  if (args.hasArg(OPT_rosegment))
     ctx->setCreateSeparateROSegment();
 
-  if (parsedArgs->hasArg(OPT_no_align_segments))
+  if (args.hasArg(OPT_no_align_segments))
     ctx->setAlignSegments(false);
 
-  if (auto *arg = parsedArgs->getLastArg(OPT_image_base)) {
+  if (auto *arg = args.getLastArg(OPT_image_base)) {
     uint64_t baseAddress = 0;
     StringRef inputValue = arg->getValue();
     if (inputValue.getAsInteger(0, baseAddress) || !baseAddress) {
@@ -487,50 +616,50 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
     ctx->setBaseAddress(baseAddress);
   }
 
-  if (parsedArgs->hasArg(OPT_merge_strings))
+  if (args.hasArg(OPT_merge_strings))
     ctx->setMergeCommonStrings(true);
 
-  if (parsedArgs->hasArg(OPT_t))
+  if (args.hasArg(OPT_t))
     ctx->setLogInputFiles(true);
 
-  if (parsedArgs->hasArg(OPT_use_shlib_undefs))
+  if (args.hasArg(OPT_use_shlib_undefs))
     ctx->setUseShlibUndefines(true);
 
-  if (auto val = getBool(*parsedArgs, OPT_allow_shlib_undefs,
+  if (auto val = getBool(args, OPT_allow_shlib_undefs,
                          OPT_no_allow_shlib_undefs))
     ctx->setAllowShlibUndefines(*val);
 
-  if (auto *arg = parsedArgs->getLastArg(OPT_e))
+  if (auto *arg = args.getLastArg(OPT_e))
     ctx->setEntrySymbolName(arg->getValue());
 
-  if (auto *arg = parsedArgs->getLastArg(OPT_output))
+  if (auto *arg = args.getLastArg(OPT_output))
     ctx->setOutputPath(arg->getValue());
 
-  if (parsedArgs->hasArg(OPT_noinhibit_exec))
+  if (args.hasArg(OPT_noinhibit_exec))
     ctx->setAllowRemainingUndefines(true);
 
-  if (auto val = getBool(*parsedArgs, OPT_export_dynamic,
+  if (auto val = getBool(args, OPT_export_dynamic,
                          OPT_no_export_dynamic))
     ctx->setExportDynamic(*val);
 
-  if (parsedArgs->hasArg(OPT_allow_multiple_definition))
+  if (args.hasArg(OPT_allow_multiple_definition))
     ctx->setAllowDuplicates(true);
 
-  if (auto *arg = parsedArgs->getLastArg(OPT_dynamic_linker))
+  if (auto *arg = args.getLastArg(OPT_dynamic_linker))
     ctx->setInterpreter(arg->getValue());
 
-  if (auto *arg = parsedArgs->getLastArg(OPT_init))
+  if (auto *arg = args.getLastArg(OPT_init))
     ctx->setInitFunction(arg->getValue());
 
-  if (auto *arg = parsedArgs->getLastArg(OPT_fini))
+  if (auto *arg = args.getLastArg(OPT_fini))
     ctx->setFiniFunction(arg->getValue());
 
-  if (auto *arg = parsedArgs->getLastArg(OPT_output_filetype))
+  if (auto *arg = args.getLastArg(OPT_output_filetype))
     ctx->setOutputFileType(arg->getValue());
 
   // Process ELF/ARM specific options
-  bool hasArmTarget1Rel = parsedArgs->hasArg(OPT_target1_rel);
-  bool hasArmTarget1Abs = parsedArgs->hasArg(OPT_target1_abs);
+  bool hasArmTarget1Rel = args.hasArg(OPT_target1_rel);
+  bool hasArmTarget1Abs = args.hasArg(OPT_target1_abs);
   if (triple.getArch() == llvm::Triple::arm) {
     if (hasArmTarget1Rel && hasArmTarget1Abs) {
       diag << "error: options --target1-rel and --target1-abs"
@@ -540,7 +669,7 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
       ctx->setArmTarget1Rel(hasArmTarget1Rel && !hasArmTarget1Abs);
     }
   } else {
-    for (const auto *arg : parsedArgs->filtered(OPT_grp_arm_targetopts)) {
+    for (const auto *arg : args.filtered(OPT_grp_arm_targetopts)) {
       diag << "warning: ignoring unsupported ARM/ELF specific argument: "
            << arg->getSpelling() << "\n";
     }
@@ -551,25 +680,25 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
       triple.getArch() == llvm::Triple::mipsel ||
       triple.getArch() == llvm::Triple::mips64 ||
       triple.getArch() == llvm::Triple::mips64el)
-    ctx->setMipsPcRelEhRel(parsedArgs->hasArg(OPT_pcrel_eh_reloc));
+    ctx->setMipsPcRelEhRel(args.hasArg(OPT_pcrel_eh_reloc));
   else {
-    for (const auto *arg : parsedArgs->filtered(OPT_grp_mips_targetopts)) {
+    for (const auto *arg : args.filtered(OPT_grp_mips_targetopts)) {
       diag << "warning: ignoring unsupported MIPS specific argument: "
            << arg->getSpelling() << "\n";
     }
   }
 
-  for (auto *arg : parsedArgs->filtered(OPT_L))
+  for (auto *arg : args.filtered(OPT_L))
     ctx->addSearchPath(arg->getValue());
 
   // Add the default search directory specific to the target.
-  if (!parsedArgs->hasArg(OPT_nostdlib))
+  if (!args.hasArg(OPT_nostdlib))
     addPlatformSearchDirs(*ctx, triple, baseTriple);
 
-  for (auto *arg : parsedArgs->filtered(OPT_u))
+  for (auto *arg : args.filtered(OPT_u))
     ctx->addInitialUndefinedSymbol(arg->getValue());
 
-  for (auto *arg : parsedArgs->filtered(OPT_defsym)) {
+  for (auto *arg : args.filtered(OPT_defsym)) {
     StringRef sym, target;
     uint64_t addr;
     if (parseDefsymAsAbsolute(arg->getValue(), sym, addr)) {
@@ -582,7 +711,7 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
     }
   }
 
-  for (auto *arg : parsedArgs->filtered(OPT_z)) {
+  for (auto *arg : args.filtered(OPT_z)) {
     StringRef opt = arg->getValue();
     if (opt == "muldefs")
       ctx->setAllowDuplicates(true);
@@ -612,14 +741,14 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
     }
   }
 
-  for (auto *arg : parsedArgs->filtered(OPT_rpath)) {
+  for (auto *arg : args.filtered(OPT_rpath)) {
     SmallVector<StringRef, 2> rpaths;
     StringRef(arg->getValue()).split(rpaths, ":");
     for (auto path : rpaths)
       ctx->addRpath(path);
   }
 
-  for (auto *arg : parsedArgs->filtered(OPT_rpath_link)) {
+  for (auto *arg : args.filtered(OPT_rpath_link)) {
     SmallVector<StringRef, 2> rpaths;
     StringRef(arg->getValue()).split(rpaths, ":");
     for (auto path : rpaths)
@@ -627,11 +756,11 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
   }
 
   // Enable new dynamic tags.
-  if (parsedArgs->hasArg(OPT_enable_newdtags))
+  if (args.hasArg(OPT_enable_newdtags))
     ctx->setEnableNewDtags(true);
 
   // Support --wrap option.
-  for (auto *arg : parsedArgs->filtered(OPT_wrap))
+  for (auto *arg : args.filtered(OPT_wrap))
     ctx->addWrapForSymbol(arg->getValue());
 
   // Register possible input file parsers.
@@ -647,7 +776,7 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
   bool wholeArchive = false;
 
   // Process files
-  for (auto arg : *parsedArgs) {
+  for (auto arg : args) {
     switch (arg->getOption().getID()) {
     case OPT_no_whole_archive:
       wholeArchive = false;
@@ -687,7 +816,7 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
       bool dashL = (arg->getOption().getID() == OPT_l);
       StringRef path = arg->getValue();
 
-      ErrorOr<StringRef> pathOrErr = findFile(*ctx, path, dashL);
+      ErrorOr<StringRef> pathOrErr = findFileELF(*ctx, path, dashL);
       if (std::error_code ec = pathOrErr.getError()) {
         auto file = llvm::make_unique<ErrorFile>(path, ec);
         auto node = llvm::make_unique<FileNode>(std::move(file));
@@ -708,7 +837,7 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
           diag << "Cannot open " << path << ": " << ec.message() << "\n";
           return false;
         }
-        bool nostdlib = parsedArgs->hasArg(OPT_nostdlib);
+        bool nostdlib = args.hasArg(OPT_nostdlib);
         std::error_code ec =
             evalLinkerScript(*ctx, std::move(mb.get()), diag, nostdlib);
         if (ec) {
@@ -758,6 +887,133 @@ bool GnuLdDriver::parse(int argc, const char *argv[],
   ctx->linkerScriptSema().perform();
 
   context.swap(ctx);
+  return true;
+}
+
+bool GnuLdDriver::parsePECOFF(llvm::opt::InputArgList &args,
+                              llvm::Triple &triple,
+                              PECOFFLinkingContext &ctx,
+                              raw_ostream &diag,
+                              bool isReadingDirectiveSection) {
+
+  // Parse may be called from multiple threads simultaneously to parse .drectve
+  // sections. This function is not thread-safe because it mutates the context
+  // object. So acquire the lock.
+  std::lock_guard<std::recursive_mutex> lock(ctx.getMutex());
+
+  // The list of input files.
+  std::vector<std::unique_ptr<File>> files;
+  std::vector<std::unique_ptr<File>> libraries;
+
+  llvm::COFF::MachineTypes type = getCOFFType(triple);
+  if (type == llvm::COFF::IMAGE_FILE_MACHINE_UNKNOWN) {
+    diag << "error: unknown machine type\n";
+    return false;
+  }
+
+  ctx.setMachineType(type);
+
+  if (args.hasArg(OPT_t))
+    ctx.setLogInputFiles(true);
+
+  //mingw-w64 never uses wide versions of mainCRTStartup
+  if(type == llvm::COFF::IMAGE_FILE_MACHINE_I386)
+    ctx.setEntrySymbolName(ctx.allocate("_mainCRTStartup"));
+  else
+    ctx.setEntrySymbolName(ctx.allocate("mainCRTStartup"));
+
+  if (auto *arg = args.getLastArg(OPT_output))
+      ctx.setOutputPath(arg->getValue());
+
+  if (auto *arg = args.getLastArg(OPT_subsystem))
+      ctx.setSubsystem(getSubsystem(arg->getValue()));
+
+  if (args.hasArg(OPT_dll)) {
+    ctx.setIsDll(true);
+    // Default base address of a DLL is 0x10000000.
+    if (!parsedArgs->hasArg(OPT_base))
+      ctx.setBaseAddress(0x10000000);
+  }
+
+  for (auto *arg : args.filtered(OPT_L))
+    ctx.appendInputSearchPath(ctx.allocate(arg->getValue()));
+
+  // Process files
+  for (auto arg : args) {
+    switch (arg->getOption().getID()) {
+    case OPT_INPUT:
+    case OPT_l:
+    case OPT_T: {
+      bool dashL = (arg->getOption().getID() == OPT_l);
+      StringRef path = arg->getValue();
+      ErrorOr<StringRef> pathOrErr = findFilePECOFF(ctx, path, dashL);
+      StringRef realpath = pathOrErr.get();
+      std::vector<std::unique_ptr<File>> curr;
+
+      if(!pathOrErr){
+        diag << "Cannot find " << path << "\n";
+        return false;
+      }
+
+      if(dashL) {
+        curr = loadFile(ctx, realpath, false);
+        for (std::unique_ptr<File> &lib : curr) {
+          if (ctx.logInputFiles())
+            diag << "lib: " << lib->path() << "\n";
+          libraries.push_back(std::move(lib));
+        }
+      } else {
+        curr = loadFile(ctx, realpath, false);
+        for (std::unique_ptr<File> &file : curr) {
+          if (ctx.logInputFiles())
+            diag << "input: " << file->path() << "\n";
+          files.push_back(std::move(file));
+        }
+      }
+      break;
+    }
+    }
+  }
+
+  for (std::unique_ptr<File> &file : files) {
+    if (isReadingDirectiveSection) {
+      File *f = file.get();
+      ctx.getTaskGroup().spawn([f] { f->parse(); });
+    }
+    ctx.getNodes().push_back(llvm::make_unique<FileNode>(std::move(file)));
+  }
+
+  // Add the library group to the linking context.
+  if (!isReadingDirectiveSection) {
+  // Add a group-end marker.
+    ctx.getNodes().push_back(llvm::make_unique<GroupEnd>(0));
+  }
+
+  // Add the library files to the library group.
+  for (std::unique_ptr<File> &file : libraries) {
+    if (!hasLibrary(ctx, file.get())) {
+      if (isReadingDirectiveSection) {
+        File *f = file.get();
+        ctx.getTaskGroup().spawn([f] { f->parse(); });
+      }
+      ctx.addLibraryFile(llvm::make_unique<FileNode>(std::move(file)));
+    }
+  }
+
+  if (ctx.getNodes().empty()) {
+    diag << "No input files\n";
+    return false;
+  }
+
+  // Set default output file name if the output file was not specified.
+  if (ctx.outputPath().empty())
+    ctx.setOutputPath("a.exe");
+
+  if (!ctx.validate(diag)) {
+    diag << "error: invalid linking context\n";
+    return false;
+  }
+
   return true;
 }
 

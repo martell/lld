@@ -354,6 +354,18 @@ def pcrel_eh_reloc : Flag<["-", "--"], "pcrel-eh-reloc">,
      HelpText<"Interpret R_MIPS_EH as R_MIPS_PC32">;
 
 //===----------------------------------------------------------------------===//
+/// Windows Target Specific Options
+//===----------------------------------------------------------------------===//
+def grp_windows_targetopts : OptionGroup<"WINDOWS SPECIFIC OPTIONS">,
+    Group<grp_targetopts>;
+def subsystem : Separate<["--"], "subsystem">, MetaVarName<"<subsystem>">,
+    HelpText<"Select target subsystem">,
+    Group<grp_windows_targetopts>;
+def dll : Separate<["-", "--"], "dll">,
+    HelpText<"Create dynamic link library">,
+    Group<grp_windows_targetopts>;
+
+//===----------------------------------------------------------------------===//
 /// Ignored options
 //===----------------------------------------------------------------------===//
 def grp_ignored: OptionGroup<"ignored">,

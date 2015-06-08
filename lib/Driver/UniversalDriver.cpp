@@ -203,7 +203,7 @@ bool UniversalDriver::link(int argc, const char *argv[],
   // Switch to appropriate driver.
   switch (flavor) {
   case Flavor::gnu_ld:
-    return GnuLdDriver::linkELF(args.size(), args.data(), diagnostics);
+    return GnuLdDriver::linkGNU(args.size(), args.data(), diagnostics);
   case Flavor::darwin_ld:
     return DarwinLdDriver::linkMachO(args.size(), args.data(), diagnostics);
   case Flavor::win_link:

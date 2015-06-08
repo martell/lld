@@ -67,14 +67,42 @@ class GnuLdDriver : public Driver {
 public:
   /// Parses command line arguments same as gnu/binutils ld and performs link.
   /// Returns true iff an error occurred.
-  static bool linkELF(int argc, const char *argv[],
+  static bool linkGNU(int argc, const char *argv[],
                       raw_ostream &diag = llvm::errs());
 
-  /// Uses gnu/binutils style ld command line options to fill in options struct.
+  /// Parses command line arguments same as gnu/binutils ld and performs link on ELF.
+  /// Returns true iff an error occurred.
+  static bool linkELF(llvm::opt::InputArgList &args,
+                      llvm::Triple &triple,
+                      llvm::Triple &baseTriple,
+                      raw_ostream &diag = llvm::errs());
+
+  /// Parses command line arguments same as gnu/binutils ld and performs link on PECOFF.
+  /// Returns true iff an error occurred.
+  static bool linkPECOFF(llvm::opt::InputArgList &args,
+                         llvm::Triple &triple,
+                         raw_ostream &diag = llvm::errs());
+
+  /// Uses gnu/binutils style ld command line options to fill in options struct for ELF.
   /// Returns true iff there was an error.
-  static bool parse(int argc, const char *argv[],
-                    std::unique_ptr<ELFLinkingContext> &context,
-                    raw_ostream &diag = llvm::errs());
+  static bool parseELF(llvm::opt::InputArgList &args,
+                       llvm::Triple &triple,
+                       llvm::Triple &baseTriple,
+                       std::unique_ptr<ELFLinkingContext> &context,
+                       raw_ostream &diag = llvm::errs());
+
+  /// Uses gnu/binutils style ld command line options to fill in options struct for PECOFF.
+  /// Returns true iff there was an error.
+  static bool parsePECOFF(llvm::opt::InputArgList &args,
+                          llvm::Triple &triple,
+                          PECOFFLinkingContext &ctx,
+                          raw_ostream &diag = llvm::errs(),
+                          bool isDirective = false);
+
+  // Same as parse(), but restricted to the context of directives.
+  static bool parseDirectives(int argc, const char *argv[],
+                              PECOFFLinkingContext &info,
+                              raw_ostream &diag = llvm::errs());
 
   /// Parses a given memory buffer as a linker script and evaluate that.
   /// Public function for testing.
