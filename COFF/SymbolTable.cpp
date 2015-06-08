@@ -23,6 +23,7 @@ namespace coff {
 
 SymbolTable::SymbolTable() {
   resolve(new (Alloc) DefinedAbsolute("__ImageBase", Config->ImageBase));
+  resolve(new (Alloc) DefinedAbsolute("__image_base__", Config->ImageBase));
   if (!Config->EntryName.empty())
     resolve(new (Alloc) Undefined(Config->EntryName));
 }
