@@ -23,10 +23,15 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/Support/Allocator.h"
+#include "llvm/Support/Errc.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 #include <bitset>
 #include <climits>
 #include <set>
+
+using llvm::sys::fs::exists;
+using llvm::sys::path::is_absolute;
 
 namespace lld {
 
@@ -212,6 +217,37 @@ bool PECOFFLinkingContext::addSectionRenaming(raw_ostream &diagnostics,
     }
   }
   return true;
+}
+
+static void buildSearchPath(SmallString<128> &path, StringRef dir,
+                            StringRef sysRoot) {
+  if (dir.startswith("=/")) {
+    // If a search directory begins with "=", "=" is replaced
+    // with the sysroot path.
+    path.assign(sysRoot);
+    path.append(dir.substr(1));
+  } else {
+    path.assign(dir);
+  }
+}
+
+ErrorOr<StringRef> PECOFFLinkingContext::searchLibrary(StringRef libName) const {
+  bool hasColonPrefix = libName[0] == ':';
+  SmallString<128> path;
+  for (StringRef dir : _inputSearchPaths) {
+    // Search for static libraries too
+    buildSearchPath(path, dir, _sysrootPath);
+    llvm::sys::path::append(path, hasColonPrefix
+                                      ? libName.drop_front()
+                                      : Twine("lib", libName) + ".a");
+
+    if (exists(path.str()))
+      return path.str().copy(_allocator);
+  }
+  if (hasColonPrefix && exists(libName.drop_front()))
+      return libName.drop_front();
+
+  return make_error_code(llvm::errc::no_such_file_or_directory);
 }
 
 /// Try to find the input library file from the search paths and append it to

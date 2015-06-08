@@ -105,6 +105,7 @@ public:
     _tempFiles.push_back(std::move(fileRemover));
   }
 
+  ErrorOr<StringRef> searchLibrary(StringRef libName) const;
   StringRef searchLibraryFile(StringRef path) const;
 
   StringRef decorateSymbol(StringRef name) const;
@@ -321,6 +322,9 @@ public:
     return _parseDirectives;
   }
 
+  StringRef getSysroot() const { return _sysrootPath; }
+  void setSysroot(StringRef path) { _sysrootPath = path; }
+
 protected:
   /// Method to create a internal file for the entry symbol
   std::unique_ptr<File> createEntrySymbolFile() const override;
@@ -402,6 +406,7 @@ private:
   std::set<std::string> _noDefaultLibs;
 
   std::vector<StringRef> _inputSearchPaths;
+  StringRef _sysrootPath = "";
   std::unique_ptr<Writer> _writer;
 
   // A map for weak aliases.
