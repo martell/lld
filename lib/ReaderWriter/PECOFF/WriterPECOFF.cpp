@@ -791,7 +791,9 @@ void AtomChunk::addBaseRelocations(std::vector<BaseReloc> &relocSites) const {
       // because that's relative to run-time image base address.
       if (auto *abs = dyn_cast<AbsoluteAtom>(ref->target()))
         if (!abs->name().equals("__ImageBase") &&
-            !abs->name().equals("___ImageBase"))
+            !abs->name().equals("___ImageBase") &&
+            !abs->name().equals("__image_base__") &&
+            !abs->name().equals("___image_base__"))
           continue;
 
       uint64_t address = layout->_virtualAddr + ref->offsetInAtom();

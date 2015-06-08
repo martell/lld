@@ -146,7 +146,7 @@ void PECOFFLinkingContext::createImplicitFiles(
       llvm::make_unique<pecoff::EntryPointFile>(*this)));
   members.insert(members.begin() + getGroupStartPos(members), std::move(entry));
 
-  // Create a file for __ImageBase.
+  // Create a file for __ImageBase and __image_base__.
   std::unique_ptr<FileNode> fileNode(new FileNode(
       llvm::make_unique<pecoff::LinkerGeneratedSymbolFile>(*this)));
   members.push_back(std::move(fileNode));

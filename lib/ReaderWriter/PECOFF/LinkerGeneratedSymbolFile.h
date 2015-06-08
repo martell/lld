@@ -97,13 +97,17 @@ class LinkerGeneratedSymbolFile : public SimpleFile {
 public:
   LinkerGeneratedSymbolFile(const PECOFFLinkingContext &ctx)
       : SimpleFile("<linker-internal-file>"),
-        _imageBaseAtom(*this, ctx.decorateSymbol("__ImageBase"),
+        _imageBaseAtomMSVC(*this, ctx.decorateSymbol("__ImageBase"),
+                       Atom::scopeGlobal, ctx.getBaseAddress()),
+        _imageBaseAtomGNU(*this, ctx.decorateSymbol("__image_base__"),
                        Atom::scopeGlobal, ctx.getBaseAddress()) {
-    addAtom(_imageBaseAtom);
+    addAtom(_imageBaseAtomMSVC);
+    addAtom(_imageBaseAtomGNU);
   };
 
 private:
-  SimpleAbsoluteAtom _imageBaseAtom;
+  SimpleAbsoluteAtom _imageBaseAtomMSVC;
+  SimpleAbsoluteAtom _imageBaseAtomGNU;
 };
 
 // A LocallyImporteSymbolFile is an archive file containing __imp_
